@@ -1,0 +1,10 @@
+*.a
+*.dylib
+*.o
+*.pyc
+*~
+.DS_Store
+.env
+.vscode
+CMakeUserPresets.json
+build
