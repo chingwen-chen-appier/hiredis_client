@@ -36,7 +36,6 @@ struct BenchmarkMetrics {
     std::atomic<long> totalSuccess{0};
     std::atomic<long> totalErrors{0};
     std::atomic<long> totalTimeouts{0};
-    std::atomic<long long> totalThreadRequestTime{0};
 };
 
 
@@ -140,7 +139,6 @@ void asyncWorker(
         auto duration =
             std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
-        metrics.totalThreadRequestTime += duration;
         metrics.totalRequests++;
 
         int errStatus = 0;
@@ -197,7 +195,6 @@ void syncWorker(
         auto duration =
             std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
-        metrics.totalThreadRequestTime += duration;
         ++metrics.totalRequests;
 
         if (!reply) {
@@ -295,6 +292,8 @@ int main(int argc, char* argv[]) {
         std::vector<std::thread> workers;
         workers.reserve(threads);
 
+        benchStart = std::chrono::high_resolution_clock::now();
+
         for (int i = 0; i < threads; ++i) {
             workers.emplace_back(
                 syncWorker,
@@ -317,25 +316,18 @@ int main(int argc, char* argv[]) {
     long long elapsedMicroseconds =
         std::chrono::duration_cast<std::chrono::microseconds>(
             benchEnd - benchStart).count();
-
+    auto average = elapsedMicroseconds / metrics.totalRequests;
     std::cout << "\n--- Benchmark Results ---\n";
     std::cout << "Total Requests: " << metrics.totalRequests << "\n";
     std::cout << "Success:        " << metrics.totalSuccess << "\n";
     std::cout << "Timeouts:       " << metrics.totalTimeouts << "\n";
     std::cout << "Errors:         " << metrics.totalErrors << "\n";
     std::cout << "Elapsed Time:   " << elapsedSeconds << " s\n";
-    std::cout << "QPS:            "
-              << metrics.totalRequests / elapsedSeconds
-              << " req/s\n";
     std::cout << "Average req time:   "
-              << (metrics.totalRequests > 0
-                  ? elapsedMicroseconds / metrics.totalRequests
-                  : 0)
+              << average
               << " us\n";
     std::cout << "Average req time (Thread):    "
-              << (metrics.totalRequests > 0
-                  ? metrics.totalThreadRequestTime / metrics.totalRequests
-                  : 0)
+              << average * threads
               << " us\n";
 
     return 0;
