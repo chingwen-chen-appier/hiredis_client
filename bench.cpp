@@ -1,7 +1,8 @@
 #include <appier/cntk/toolbox/toolbox.hpp>
-#include <appier/cntk/flow/flow.hpp>
-#include <appier/cntk/proc/ping_data.hpp>
-#include <appier/cntk/storage/storage.hpp>
+#include <appier/cntk/toolbox/command_line.hpp>
+#include <appier/cntk/toolbox/config.hpp>
+#include <appier/cntk/toolbox/data_id.h>
+#include <appier/cntk/toolbox/data.hpp>
 
 #include <iostream>
 #include <vector>
@@ -20,17 +21,39 @@
 
 
 namespace apct = appier::cntk::toolbox;
-namespace apcf = appier::cntk::flow;
-namespace apcp = appier::cntk::proc;
-namespace apcs = appier::cntk::storage;
+
+
+namespace {
 
 
 constexpr int REDIS_ERR_BATCHTIMEOUT = 100;
+const uint32_t BENCH_CMD_DATA_ID = APCT_MAX_DATA_ID - 1;
 
 
 using RedisReplyPointer =
     std::unique_ptr<redisReply, decltype(&freeReplyObject)>;
 using RedisContextPtr = std::unique_ptr<redisContext, decltype(&redisFree)>;
+
+
+class BenchSharedData : public apct::Data {
+public:
+    BenchSharedData() : apct::Data(BENCH_CMD_DATA_ID) { }
+
+    std::shared_ptr<Data> clone() const override {
+        return std::make_shared<BenchSharedData>(*this);
+    }
+
+    void setConfig(const YAML::Node& conf) {
+        config_ = conf;
+    }
+
+    const YAML::Node& config() const noexcept {
+        return config_;
+    }
+
+private:
+    YAML::Node config_;
+};
 
 
 struct RedisRequest {
@@ -166,7 +189,7 @@ uint32_t murmurHash(const std::string& value, uint32_t seed = 0) {
 }
 
 
-void redisWorker(apct::Channel<std::shared_ptr<BatchInfo>>& asyncCh) {
+void asyncRedisWorker(apct::Channel<std::shared_ptr<BatchInfo>>& asyncCh) {
     while (true) {
         auto [info, ok] = asyncCh.read();
         if (!ok) break;
@@ -344,137 +367,223 @@ void syncWorker(
 }
 
 
-int main(int argc, char* argv[]) {
-    if (argc < 7) {
-        std::cerr << "Usage: " << argv[0]
-                << " <async[true|false]> <wait_duration> <worker_threads>"
-                << " <times> <batches> <config.yaml> [async_threads]\n";
-        return 1;
+class RedisBenchCommand : public apct::Command {
+public:
+    RedisBenchCommand() : apct::Command("bench", "Run Redis benchmark") { }
+
+private:
+    void setup() override {
+        auto app = cliApp();
+        app->add_flag("--async",
+                      asyncMode_,
+                      "Use asynchronous operations for benchmark");
+        app->add_option("--wait",
+                        waitDuration_,
+                        "Wait duration (in microseconds) for batch timeout")
+            ->default_val(10000);
+        app->add_option("--workers",
+                        workerThreadCount_,
+                        "Number of worker threads")
+            ->default_val(1);
+        app->add_option("--times",
+                        times_,
+                        "Number of times to iterate through user IDs")
+            ->default_val(1);
+        app->add_option("--batches",
+                        batches_,
+                        "Number of requests per batch")
+            ->default_val(10);
+        app->add_option("--async-threads",
+                        asyncThreadCount_,
+                        "Number of async Redis worker threads "
+                        "(async mode only)")
+            ->default_val(0);
     }
 
-    const bool asyncMode = std::string(argv[1]) == "true";
-    const uint64_t waitDuration = std::stoull(argv[2]);
-    const int workerThreadCount = std::stoi(argv[3]);
-    const int times = std::stoi(argv[4]);
-    const int batches = std::stoi(argv[5]);
-    const std::string configPath = argv[6];
+    std::pair<int, bool> forwardRun() override {
+        auto sdata = apct::fetchData<BenchSharedData>(
+            commandMain()->sharedData(), BENCH_CMD_DATA_ID);
 
-    int asyncThreadCount = workerThreadCount;
-    if (asyncMode && argc >= 8) {
-        asyncThreadCount = std::stoi(argv[7]);
-    }
+        const auto& config = sdata->config();
 
-    YAML::Node config = YAML::LoadFile(configPath);
-    const int poolSize = config["pool_size"].as<int>();
-    const int connectionTimeoutMs = config["connection_timeout_ms"].as<int>();
-    const int queryTimeoutMs = config["query_timeout_ms"].as<int>();
-    const std::string userIdFile = config["user_id_file"].as<std::string>();
-    const std::string redisKey = config["user_db_key"].as<std::string>();
+        const int poolSize = config["pool_size"].as<int>();
+        const int connectionTimeoutMs =
+            config["connection_timeout_ms"].as<int>();
+        const int queryTimeoutMs = config["query_timeout_ms"].as<int>();
+        const std::string userIdFile = config["user_id_file"].as<std::string>();
+        const std::string redisKey = config["user_db_key"].as<std::string>();
 
-    timeval connectionTimeout{connectionTimeoutMs / 1000,
-                              (connectionTimeoutMs % 1000) * 1000};
-    timeval queryTimeout{queryTimeoutMs / 1000, (queryTimeoutMs % 1000) * 1000};
+        timeval connectionTimeout{connectionTimeoutMs / 1000,
+                                  (connectionTimeoutMs % 1000) * 1000};
+        timeval queryTimeout{queryTimeoutMs / 1000,
+                             (queryTimeoutMs % 1000) * 1000};
 
-    RedisPoolSet poolSet;
-    for (const auto& entry : config["redis_pool_set"]) {
-        const auto& server = entry[0];
-        poolSet.addPool(std::make_unique<RedisPool>(
-            server["host"].as<std::string>(),
-            server["port"].as<int>(),
-            poolSize,
-            connectionTimeout,
-            queryTimeout
-        ));
-    }
-
-    std::vector<std::string> userIds;
-    std::ifstream infile(userIdFile);
-    for (std::string line; std::getline(infile, line);) {
-        if (!line.empty()) userIds.emplace_back(std::move(line));
-    }
-
-    apct::Channel<std::string> userIdCh(1000);
-    std::thread userThread([&] {
-        for (size_t n = 0; n < times; ++n) {
-            for (const auto& id : userIds) {
-                userIdCh.write(id);
+        RedisPoolSet poolSet;
+        for (const auto& redisPool : config["redis_pool_set"]) {
+            for (const auto& poolObject : redisPool) {
+                poolSet.addPool(std::make_unique<RedisPool>(
+                    poolObject["host"].as<std::string>(),
+                    poolObject["port"].as<int>(),
+                    poolSize,
+                    connectionTimeout,
+                    queryTimeout
+                ));
             }
         }
-        userIdCh.close();
-    });
 
-    BenchmarkMetrics metrics;
-    std::chrono::high_resolution_clock::time_point benchStart;
-
-    if (asyncMode) {
-        std::cout << "Running in asynchronous mode.\n";
-
-        apct::Channel<std::shared_ptr<BatchInfo>> asyncCh(1000);
-        std::vector<std::thread> asyncThreads;
-        for (int i = 0; i < asyncThreadCount; ++i)
-            asyncThreads.emplace_back(redisWorker, std::ref(asyncCh));
-
-        benchStart = std::chrono::high_resolution_clock::now();
-
-        std::vector<std::thread> workers;
-        for (int i = 0; i < workerThreadCount; ++i) {
-            workers.emplace_back(asyncWorker, waitDuration, batches,
-                                 std::cref(redisKey), std::ref(poolSet),
-                                 std::ref(userIdCh), std::ref(asyncCh),
-                                 std::ref(metrics));
+        std::vector<std::string> userIds;
+        std::ifstream infile(userIdFile);
+        for (std::string line; std::getline(infile, line);) {
+            if (!line.empty()) userIds.emplace_back(std::move(line));
         }
 
-        for (auto& worker : workers) {
-            worker.join();
+        if (asyncMode_ && asyncThreadCount_ == 0) {
+            asyncThreadCount_ = workerThreadCount_;
         }
 
-        asyncCh.close();
+        apct::Channel<std::string> userIdCh(1000);
+        std::thread userThread([&] {
+            for (size_t n = 0; n < times_; ++n) {
+                for (const auto& id : userIds) {
+                    userIdCh.write(id);
+                }
+            }
+            userIdCh.close();
+        });
 
-        for (auto& thread : asyncThreads) {
-            thread.join();
+        BenchmarkMetrics metrics;
+        std::chrono::high_resolution_clock::time_point benchStart;
+
+        if (asyncMode_) {
+            std::cout << "Running in asynchronous mode.\n";
+
+            apct::Channel<std::shared_ptr<BatchInfo>> asyncCh(1000);
+            std::vector<std::thread> asyncThreads;
+            for (int i = 0; i < asyncThreadCount_; ++i)
+                asyncThreads.emplace_back(asyncRedisWorker, std::ref(asyncCh));
+
+            benchStart = std::chrono::high_resolution_clock::now();
+
+            std::vector<std::thread> workers;
+            for (int i = 0; i < workerThreadCount_; ++i) {
+                workers.emplace_back(asyncWorker, waitDuration_, batches_,
+                                     std::cref(redisKey), std::ref(poolSet),
+                                     std::ref(userIdCh), std::ref(asyncCh),
+                                     std::ref(metrics));
+            }
+
+            for (auto& worker : workers) {
+                worker.join();
+            }
+
+            asyncCh.close();
+
+            for (auto& thread : asyncThreads) {
+                thread.join();
+            }
+        } else {
+            std::cout << "Running in synchronous mode.\n";
+
+            std::vector<std::thread> workers;
+            workers.reserve(workerThreadCount_);
+
+            benchStart = std::chrono::high_resolution_clock::now();
+
+            for (int i = 0; i < workerThreadCount_; ++i) {
+                workers.emplace_back(syncWorker, std::cref(waitDuration_),
+                                     std::cref(batches_), std::cref(redisKey),
+                                     std::ref(poolSet), std::ref(userIdCh),
+                                     std::ref(metrics));
+            }
+
+            for (auto& worker : workers) {
+                worker.join();
+            }
         }
-    } else {
-        std::cout << "Running in synchronous mode.\n";
 
-        std::vector<std::thread> workers;
-        workers.reserve(workerThreadCount);
+        userThread.join();
 
-        benchStart = std::chrono::high_resolution_clock::now();
+        auto benchEnd = std::chrono::high_resolution_clock::now();
+        double elapsedSeconds =
+            std::chrono::duration<double>(benchEnd - benchStart).count();
+        long long elapsedMicroseconds =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                benchEnd - benchStart).count();
+        double average = elapsedMicroseconds / metrics.totalRequests;
 
-        for (int i = 0; i < workerThreadCount; ++i) {
-            workers.emplace_back(syncWorker, std::cref(waitDuration),
-                                 std::cref(batches), std::cref(redisKey),
-                                 std::ref(poolSet), std::ref(userIdCh),
-                                 std::ref(metrics));
-        }
+        std::cout << "\n--- Benchmark Results ---\n";
+        std::cout << "Total Requests: " << metrics.totalRequests << "\n";
+        std::cout << "Success:        " << metrics.totalSuccess << "\n";
+        std::cout << "Query Timeouts: " << metrics.totalQueryTimeouts << "\n";
+        std::cout << "Batch Timeouts: " << metrics.totalBatchTimeouts << "\n";
+        std::cout << "Errors:         " << metrics.totalErrors << "\n";
+        std::cout << "Elapsed Time:   " << elapsedSeconds << " s\n";
+        std::cout << "Average req time:   "
+                  << average
+                  << " us\n";
+        std::cout << "Average req time (Thread):   "
+                  << average * workerThreadCount_
+                  << " us\n";
 
-        for (auto& worker : workers) {
-            worker.join();
-        }
+        return { 0, false };
     }
 
-    userThread.join();
+private:
+    bool asyncMode_ = false;
+    uint64_t waitDuration_ = 1000;
+    int workerThreadCount_ = 1;
+    int times_ = 1;
+    int batches_ = 100;
+    int asyncThreadCount_ = 0;
+};
 
-    auto benchEnd = std::chrono::high_resolution_clock::now();
-    double elapsedSeconds =
-        std::chrono::duration<double>(benchEnd - benchStart).count();
-    long long elapsedMicroseconds =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            benchEnd - benchStart).count();
-    double average = elapsedMicroseconds / metrics.totalRequests;
-    std::cout << "\n--- Benchmark Results ---\n";
-    std::cout << "Total Requests: " << metrics.totalRequests << "\n";
-    std::cout << "Success:        " << metrics.totalSuccess << "\n";
-    std::cout << "Query Timeouts:       " << metrics.totalQueryTimeouts << "\n";
-    std::cout << "Batch Timeouts:       " << metrics.totalBatchTimeouts << "\n";
-    std::cout << "Errors:         " << metrics.totalErrors << "\n";
-    std::cout << "Elapsed Time:   " << elapsedSeconds << " s\n";
-    std::cout << "Average req time:   "
-              << average
-              << " us\n";
-    std::cout << "Average req time (Thread):    "
-              << average * workerThreadCount
-              << " us\n";
 
-    return 0;
+class MainCommand : public apct::Command {
+public:
+    MainCommand() : apct::Command("Redis Benchmark Tool") { }
+
+private:
+    void setup() override {
+        auto app = cliApp();
+        app->add_option("--config,-c",
+                        configPath_,
+                        "Path to the configuration YAML file")
+            ->required();
+
+        addSubcommand(std::make_unique<RedisBenchCommand>());
+    }
+
+    std::pair<int, bool> forwardRun() override {
+        if (configPath_.empty()) {
+            std::cerr << "Configuration file is required.\n";
+            return { -1, false };
+        }
+
+        YAML::Node config = YAML::LoadFile(configPath_);
+
+        auto sharedData = std::make_shared<BenchSharedData>();
+        sharedData->setConfig(config);
+        commandMain()->sharedData().addData(std::move(sharedData));
+
+        return { 0, true };
+    }
+
+private:
+    std::string configPath_;
+};
+
+
+} // namespace
+
+
+int main(int argc, char* argv[]) {
+    try {
+        return apct::CommandMain(std::make_unique<MainCommand>())(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return -1;
+    } catch (...) {
+        std::cerr << "Unknown error occurred." << std::endl;
+        return -1;
+    }
 }
