@@ -149,11 +149,13 @@ private:
 };
 
 
-struct BatchOp {
+struct BatchInfo {
     RedisContextPtr ctx;
     RedisPool* pool;
     std::atomic<bool> completed{false};
     RedisRequest request;
+    std::shared_ptr<apct::WaitGroup> wg;
+    std::string redisKey;
 };
 
 
@@ -164,19 +166,46 @@ uint32_t murmurHash(const std::string& value, uint32_t seed = 0) {
 }
 
 
+void redisWorker(apct::Channel<std::shared_ptr<BatchInfo>>& asyncCh) {
+    while (true) {
+        auto [info, ok] = asyncCh.read();
+        if (!ok) break;
+
+        redisContext* ctx = info->ctx.get();
+        RedisReplyPointer reply(
+            static_cast<redisReply*>(
+                redisCommand(ctx, "HGET %s %s",
+                             info->redisKey.c_str(),
+                             info->request.userId.c_str())
+            ),
+            freeReplyObject
+        );
+
+        if (!info->completed.exchange(true)) {
+            int err = reply ? REDIS_OK : ctx->err;
+            info->request.onFinish(err);
+        }
+
+        info->pool->release(std::move(info->ctx));
+        info->wg->done();
+    }
+}
+
+
 void asyncWorker(
         const uint64_t waitDuration,
         const int batches,
         const std::string& redisKey,
         RedisPoolSet& poolSet,
         apct::Channel<std::string>& userIdCh,
+        apct::Channel<std::shared_ptr<BatchInfo>>& asyncCh,
         BenchmarkMetrics& metrics,
         apct::WaitGroup& workerWg) {
 
     while (true) {
         auto batchWg = std::make_shared<apct::WaitGroup>();
-        std::vector<std::shared_ptr<BatchOp>> batchOps;
-        batchOps.reserve(batches);
+        std::vector<std::shared_ptr<BatchInfo>> batchInfos;
+        batchInfos.reserve(batches);
 
         bool channelClosed = false;
         for (int i = 0; i < batches; ++i) {
@@ -212,42 +241,27 @@ void asyncWorker(
                 }
             };
 
-            auto batchOp = std::shared_ptr<BatchOp>(
-                new BatchOp{std::move(ctx), &pool, false, std::move(request)}
-            );
-            batchOps.push_back(batchOp);
+            auto batchInfo = std::make_shared<BatchInfo>(std::move(ctx),
+                                                     &pool,
+                                                     false,
+                                                     std::move(request),
+                                                     batchWg,
+                                                     redisKey);
+            batchInfos.push_back(batchInfo);
             batchWg->add(1);
-
-            std::thread([batchOp, batchWg, redisKey, &metrics]() {
-                redisContext* ctxPtr = batchOp->ctx.get();
-                RedisReplyPointer reply(
-                    static_cast<redisReply*>(
-                        redisCommand(ctxPtr, "HGET %s %s",
-                                     redisKey.c_str(),
-                                     batchOp->request.userId.c_str())
-                    ),
-                    freeReplyObject
-                );
-
-                if (batchOp->completed.exchange(true)) {
-                    batchOp->request.onFinish(REDIS_ERR_BATCHTIMEOUT);
-                } else {
-                    int errStatus = reply ? REDIS_OK : ctxPtr->err;
-                    batchOp->request.onFinish(errStatus);
-                }
-
-                batchOp->pool->release(std::move(batchOp->ctx));
-                batchWg->done();
-            }).detach();
+            asyncCh.write(batchInfo);
         }
 
         bool batchCompleted =
             batchWg->wait(std::chrono::microseconds(waitDuration));
 
         if (!batchCompleted) {
-            for (auto& batchOp : batchOps) {
-                batchOp->completed.exchange(true);
+            for (auto& batchInfo : batchInfos) {
+                if (!batchInfo->completed.exchange(true)) {
+                    batchInfo->request.onFinish(REDIS_ERR_BATCHTIMEOUT);
+                }
             }
+            batchWg->wait();
         }
 
         if (channelClosed) {
@@ -336,9 +350,10 @@ void syncWorker(
 
 
 int main(int argc, char* argv[]) {
-    if (argc < 4) {
+    if (argc < 7) {
         std::cerr << "Usage: " << argv[0]
-                  << " <async[true|false]> <wait_duration> <threads> <times> <batches> <config.yaml>\n";
+                << " <asyncWorker[true|false]> <wait_duration> <threads>"
+                << " <times> <batches> <config.yaml>\n";
         return 1;
     }
 
@@ -401,18 +416,33 @@ int main(int argc, char* argv[]) {
         std::cout << "Running in asynchronous mode.\n";
 
         apct::WaitGroup workerWg;
+        apct::Channel<std::shared_ptr<BatchInfo>> asyncCh(1000);
+
+        std::vector<std::thread> asyncThreads;
+        for (int i = 0; i < threads; ++i)
+            asyncThreads.emplace_back(redisWorker, std::ref(asyncCh));
 
         benchStart = std::chrono::high_resolution_clock::now();
 
+        std::vector<std::thread> workers;
         for (int i = 0; i < threads; ++i) {
             workerWg.add(1);
-            std::thread(asyncWorker, std::cref(waitDuration),
-                        std::cref(batches), std::cref(redisKey),
-                        std::ref(poolSet), std::ref(userIdCh),
-                        std::ref(metrics), std::ref(workerWg)).detach();
+            workers.emplace_back(asyncWorker, waitDuration, batches,
+                                 std::cref(redisKey), std::ref(poolSet),
+                                 std::ref(userIdCh), std::ref(asyncCh),
+                                 std::ref(metrics), std::ref(workerWg));
         }
 
         workerWg.wait();
+        asyncCh.close();
+
+        for (auto& worker : workers) {
+            worker.join();
+        }
+
+        for (auto& thread : asyncThreads) {
+            thread.join();
+        }
     } else {
         std::cout << "Running in synchronous mode.\n";
 
@@ -441,7 +471,7 @@ int main(int argc, char* argv[]) {
     long long elapsedMicroseconds =
         std::chrono::duration_cast<std::chrono::microseconds>(
             benchEnd - benchStart).count();
-    auto average = elapsedMicroseconds / metrics.totalRequests;
+    double average = static_cast<double>(elapsedMicroseconds) / metrics.totalRequests;
     std::cout << "\n--- Benchmark Results ---\n";
     std::cout << "Total Requests: " << metrics.totalRequests << "\n";
     std::cout << "Success:        " << metrics.totalSuccess << "\n";
