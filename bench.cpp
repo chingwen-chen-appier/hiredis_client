@@ -186,12 +186,13 @@ void asyncWorker(
                 break;
             }
 
+            ++metrics.totalRequests;
+
             size_t poolIndex = murmurHash(uid) % poolSet.size();
             RedisPool& pool = poolSet.get(poolIndex);
 
             auto ctx = pool.acquire();
             if (!ctx) {
-                ++metrics.totalRequests;
                 ++metrics.totalErrors;
                 continue;
             }
@@ -199,7 +200,6 @@ void asyncWorker(
             RedisRequest request{
                 std::move(uid),
                 [&metrics](int errStatus) {
-                    ++metrics.totalRequests;
                     if (errStatus == REDIS_OK) {
                         ++metrics.totalSuccess;
                     } else if (errStatus == REDIS_ERR_TIMEOUT) {
@@ -270,6 +270,7 @@ void syncWorker(
     while (true) {
         auto batchStart = std::chrono::high_resolution_clock::now();
         bool channelClosed = false;
+        bool batchTimedOut = false;
         for (int i = 0; i < batches; ++i) {
             auto [uid, ok] = userIdCh.read();
             if (!ok) {
@@ -277,13 +278,9 @@ void syncWorker(
                 break;
             }
 
-            auto elapsed =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::high_resolution_clock::now() -
-                    batchStart).count();
+            ++metrics.totalRequests;
 
-            if (elapsed >= waitDuration) {
-                ++metrics.totalRequests;
+            if (batchTimedOut) {
                 ++metrics.totalBatchTimeouts;
                 continue;
             }
@@ -293,7 +290,6 @@ void syncWorker(
 
             auto ctx = pool.acquire();
             if (!ctx) {
-                ++metrics.totalRequests;
                 ++metrics.totalErrors;
                 continue;
             }
@@ -307,7 +303,17 @@ void syncWorker(
                 freeReplyObject
             );
 
-            ++metrics.totalRequests;
+            auto elapsed =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::high_resolution_clock::now() -
+                    batchStart).count();
+
+            if (elapsed >= waitDuration) {
+                batchTimedOut = true;
+                ++metrics.totalBatchTimeouts;
+                pool.release(std::move(ctx));
+                continue;
+            }
 
             if (!reply) {
                 if (ctx->err == REDIS_ERR_TIMEOUT) {
@@ -397,6 +403,7 @@ int main(int argc, char* argv[]) {
         apct::WaitGroup workerWg;
 
         benchStart = std::chrono::high_resolution_clock::now();
+
         for (int i = 0; i < threads; ++i) {
             workerWg.add(1);
             std::thread(asyncWorker, std::cref(waitDuration),
@@ -416,18 +423,18 @@ int main(int argc, char* argv[]) {
 
         for (int i = 0; i < threads; ++i) {
             workers.emplace_back(syncWorker, std::cref(waitDuration),
-                        std::cref(batches), std::cref(redisKey),
-                        std::ref(poolSet), std::ref(userIdCh),
-                        std::ref(metrics));
+                                 std::cref(batches), std::cref(redisKey),
+                                 std::ref(poolSet), std::ref(userIdCh),
+                                 std::ref(metrics));
         }
 
         for (auto& worker : workers) {
             worker.join();
         }
     }
-    auto benchEnd = std::chrono::high_resolution_clock::now();
 
     userThread.join();
+    auto benchEnd = std::chrono::high_resolution_clock::now();
 
     double elapsedSeconds =
         std::chrono::duration<double>(benchEnd - benchStart).count();
