@@ -19,19 +19,17 @@
 #include "MurmurHash3.h"
 
 
-constexpr int REDIS_ERR_BATCHTIMEOUT = 100;
-
-
 namespace apct = appier::cntk::toolbox;
 namespace apcf = appier::cntk::flow;
 namespace apcp = appier::cntk::proc;
 namespace apcs = appier::cntk::storage;
 
 
+constexpr int REDIS_ERR_BATCHTIMEOUT = 100;
+
+
 using RedisReplyPointer =
     std::unique_ptr<redisReply, decltype(&freeReplyObject)>;
-
-
 using RedisContextPtr = std::unique_ptr<redisContext, decltype(&redisFree)>;
 
 
@@ -52,10 +50,11 @@ struct BenchmarkMetrics {
 
 class RedisPool {
 public:
-    RedisPool(const std::string& host, int port, int poolSize,
-              const timeval& connectionTimeout, const timeval& queryTimeout)
-        : host_(host), port_(port), poolSize_(poolSize),
-          connectionTimeout_(connectionTimeout), queryTimeout_(queryTimeout) {
+    RedisPool(const std::string& host, const int port, const int poolSize,
+        const timeval& connectionTimeout, const timeval& queryTimeout)
+            : host_(host), port_(port), poolSize_(poolSize),
+              connectionTimeout_(connectionTimeout),
+              queryTimeout_(queryTimeout) {
         for (int i = 0; i < poolSize_; ++i) {
             auto ctx = createConnection();
             if (ctx) {
@@ -120,6 +119,7 @@ private:
         return RedisContextPtr(rawCtx, redisFree);
     }
 
+private:
     std::deque<RedisContextPtr> pool_;
     std::mutex mtx_;
     std::string host_;
@@ -184,6 +184,8 @@ void redisWorker(apct::Channel<std::shared_ptr<BatchInfo>>& asyncCh) {
         if (!info->completed.exchange(true)) {
             int err = reply ? REDIS_OK : ctx->err;
             info->request.onFinish(err);
+        } else {
+            info->request.onFinish(REDIS_ERR_BATCHTIMEOUT);
         }
 
         info->pool->release(std::move(info->ctx));
@@ -199,8 +201,7 @@ void asyncWorker(
         RedisPoolSet& poolSet,
         apct::Channel<std::string>& userIdCh,
         apct::Channel<std::shared_ptr<BatchInfo>>& asyncCh,
-        BenchmarkMetrics& metrics,
-        apct::WaitGroup& workerWg) {
+        BenchmarkMetrics& metrics) {
 
     while (true) {
         auto batchWg = std::make_shared<apct::WaitGroup>();
@@ -257,10 +258,9 @@ void asyncWorker(
 
         if (!batchCompleted) {
             for (auto& batchInfo : batchInfos) {
-                if (!batchInfo->completed.exchange(true)) {
-                    batchInfo->request.onFinish(REDIS_ERR_BATCHTIMEOUT);
-                }
+                batchInfo->completed.exchange(true);
             }
+
             batchWg->wait();
         }
 
@@ -268,8 +268,6 @@ void asyncWorker(
             break;
         }
     }
-
-    workerWg.done();
 }
 
 
@@ -280,9 +278,9 @@ void syncWorker(
         RedisPoolSet& poolSet,
         apct::Channel<std::string>& userIdCh,
         BenchmarkMetrics& metrics) {
-
     while (true) {
-        auto batchStart = std::chrono::high_resolution_clock::now();
+        auto batchDeadline = std::chrono::high_resolution_clock::now() +
+                             std::chrono::microseconds(waitDuration);
         bool channelClosed = false;
         bool batchTimedOut = false;
         for (int i = 0; i < batches; ++i) {
@@ -317,12 +315,9 @@ void syncWorker(
                 freeReplyObject
             );
 
-            auto elapsed =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::high_resolution_clock::now() -
-                    batchStart).count();
+            auto now = std::chrono::high_resolution_clock::now();
 
-            if (elapsed >= waitDuration) {
+            if (now > batchDeadline) {
                 batchTimedOut = true;
                 ++metrics.totalBatchTimeouts;
                 pool.release(std::move(ctx));
@@ -352,34 +347,33 @@ void syncWorker(
 int main(int argc, char* argv[]) {
     if (argc < 7) {
         std::cerr << "Usage: " << argv[0]
-                << " <asyncWorker[true|false]> <wait_duration> <threads>"
-                << " <times> <batches> <config.yaml>\n";
+                << " <async[true|false]> <wait_duration> <worker_threads>"
+                << " <times> <batches> <config.yaml> [async_threads]\n";
         return 1;
     }
 
     const bool asyncMode = std::string(argv[1]) == "true";
     const uint64_t waitDuration = std::stoull(argv[2]);
-    const int threads = std::stoi(argv[3]);
+    const int workerThreadCount = std::stoi(argv[3]);
     const int times = std::stoi(argv[4]);
     const int batches = std::stoi(argv[5]);
     const std::string configPath = argv[6];
-    YAML::Node config = YAML::LoadFile(configPath);
 
+    int asyncThreadCount = workerThreadCount;
+    if (asyncMode && argc >= 8) {
+        asyncThreadCount = std::stoi(argv[7]);
+    }
+
+    YAML::Node config = YAML::LoadFile(configPath);
     const int poolSize = config["pool_size"].as<int>();
     const int connectionTimeoutMs = config["connection_timeout_ms"].as<int>();
     const int queryTimeoutMs = config["query_timeout_ms"].as<int>();
     const std::string userIdFile = config["user_id_file"].as<std::string>();
     const std::string redisKey = config["user_db_key"].as<std::string>();
 
-    timeval connectionTimeout{
-        connectionTimeoutMs / 1000,
-        (connectionTimeoutMs % 1000) * 1000
-    };
-
-    timeval queryTimeout{
-        queryTimeoutMs / 1000,
-        (queryTimeoutMs % 1000) * 1000
-    };
+    timeval connectionTimeout{connectionTimeoutMs / 1000,
+                              (connectionTimeoutMs % 1000) * 1000};
+    timeval queryTimeout{queryTimeoutMs / 1000, (queryTimeoutMs % 1000) * 1000};
 
     RedisPoolSet poolSet;
     for (const auto& entry : config["redis_pool_set"]) {
@@ -399,7 +393,7 @@ int main(int argc, char* argv[]) {
         if (!line.empty()) userIds.emplace_back(std::move(line));
     }
 
-    apct::Channel<std::string> userIdCh(100);
+    apct::Channel<std::string> userIdCh(1000);
     std::thread userThread([&] {
         for (size_t n = 0; n < times; ++n) {
             for (const auto& id : userIds) {
@@ -415,30 +409,26 @@ int main(int argc, char* argv[]) {
     if (asyncMode) {
         std::cout << "Running in asynchronous mode.\n";
 
-        apct::WaitGroup workerWg;
         apct::Channel<std::shared_ptr<BatchInfo>> asyncCh(1000);
-
         std::vector<std::thread> asyncThreads;
-        for (int i = 0; i < threads; ++i)
+        for (int i = 0; i < asyncThreadCount; ++i)
             asyncThreads.emplace_back(redisWorker, std::ref(asyncCh));
 
         benchStart = std::chrono::high_resolution_clock::now();
 
         std::vector<std::thread> workers;
-        for (int i = 0; i < threads; ++i) {
-            workerWg.add(1);
+        for (int i = 0; i < workerThreadCount; ++i) {
             workers.emplace_back(asyncWorker, waitDuration, batches,
                                  std::cref(redisKey), std::ref(poolSet),
                                  std::ref(userIdCh), std::ref(asyncCh),
-                                 std::ref(metrics), std::ref(workerWg));
+                                 std::ref(metrics));
         }
-
-        workerWg.wait();
-        asyncCh.close();
 
         for (auto& worker : workers) {
             worker.join();
         }
+
+        asyncCh.close();
 
         for (auto& thread : asyncThreads) {
             thread.join();
@@ -447,11 +437,11 @@ int main(int argc, char* argv[]) {
         std::cout << "Running in synchronous mode.\n";
 
         std::vector<std::thread> workers;
-        workers.reserve(threads);
+        workers.reserve(workerThreadCount);
 
         benchStart = std::chrono::high_resolution_clock::now();
 
-        for (int i = 0; i < threads; ++i) {
+        for (int i = 0; i < workerThreadCount; ++i) {
             workers.emplace_back(syncWorker, std::cref(waitDuration),
                                  std::cref(batches), std::cref(redisKey),
                                  std::ref(poolSet), std::ref(userIdCh),
@@ -464,14 +454,14 @@ int main(int argc, char* argv[]) {
     }
 
     userThread.join();
-    auto benchEnd = std::chrono::high_resolution_clock::now();
 
+    auto benchEnd = std::chrono::high_resolution_clock::now();
     double elapsedSeconds =
         std::chrono::duration<double>(benchEnd - benchStart).count();
     long long elapsedMicroseconds =
         std::chrono::duration_cast<std::chrono::microseconds>(
             benchEnd - benchStart).count();
-    double average = static_cast<double>(elapsedMicroseconds) / metrics.totalRequests;
+    double average = elapsedMicroseconds / metrics.totalRequests;
     std::cout << "\n--- Benchmark Results ---\n";
     std::cout << "Total Requests: " << metrics.totalRequests << "\n";
     std::cout << "Success:        " << metrics.totalSuccess << "\n";
@@ -483,7 +473,7 @@ int main(int argc, char* argv[]) {
               << average
               << " us\n";
     std::cout << "Average req time (Thread):    "
-              << average * threads
+              << average * workerThreadCount
               << " us\n";
 
     return 0;
