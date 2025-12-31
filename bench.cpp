@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <memory>
+#include <cerrno>
 
 #include <hiredis/hiredis.h>
 #include <yaml-cpp/yaml.h>
@@ -28,6 +29,7 @@ namespace {
 
 constexpr int REDIS_ERR_BATCHTIMEOUT = 100;
 const uint32_t BENCH_CMD_DATA_ID = APCT_MAX_DATA_ID - 1;
+enum class RequestState { Pending, Completed, BatchTimeout };
 
 
 using RedisReplyPointer =
@@ -53,12 +55,6 @@ public:
 
 private:
     YAML::Node config_;
-};
-
-
-struct RedisRequest {
-    std::string userId;
-    std::function<void(int err)> onFinish;
 };
 
 
@@ -172,13 +168,36 @@ private:
 };
 
 
+struct RedisRequest {
+    std::string userId;
+    std::function<void(int err)> onFinish;
+    std::atomic<RequestState> state{RequestState::Pending};
+
+    RedisRequest(std::string userId_,
+                 std::function<void(int err)> onFinish_)
+        : userId(std::move(userId_)),
+          onFinish(std::move(onFinish_)) {}
+};
+
+
 struct BatchInfo {
     RedisContextPtr ctx;
     RedisPool* pool;
-    std::atomic<bool> completed{false};
     RedisRequest request;
     std::shared_ptr<apct::WaitGroup> wg;
     std::string redisKey;
+
+    BatchInfo(RedisContextPtr ctx_,
+              RedisPool* pool_,
+              std::string userId_,
+              std::function<void(int err)> onFinish_,
+              std::shared_ptr<apct::WaitGroup> wg_,
+              std::string redisKey_)
+        : ctx(std::move(ctx_)),
+          pool(pool_),
+          request(std::move(userId_), std::move(onFinish_)),
+          wg(std::move(wg_)),
+          redisKey(std::move(redisKey_)) {}
 };
 
 
@@ -204,7 +223,9 @@ void asyncRedisWorker(apct::Channel<std::shared_ptr<BatchInfo>>& asyncCh) {
             freeReplyObject
         );
 
-        if (!info->completed.exchange(true)) {
+        auto expected = RequestState::Pending;
+        if (info->request.state.compare_exchange_strong(
+                expected, RequestState::Completed, std::memory_order_acq_rel)) {
             int err = reply ? REDIS_OK : ctx->err;
             info->request.onFinish(err);
         } else {
@@ -250,7 +271,9 @@ void asyncWorker(
                 continue;
             }
 
-            RedisRequest request{
+            auto batchInfo = std::make_shared<BatchInfo>(
+                std::move(ctx),
+                &pool,
                 std::move(uid),
                 [&metrics](int errStatus) {
                     if (errStatus == REDIS_OK) {
@@ -262,15 +285,10 @@ void asyncWorker(
                     } else {
                         ++metrics.totalErrors;
                     }
-                }
-            };
-
-            auto batchInfo = std::make_shared<BatchInfo>(std::move(ctx),
-                                                     &pool,
-                                                     false,
-                                                     std::move(request),
-                                                     batchWg,
-                                                     redisKey);
+                },
+                batchWg,
+                redisKey
+            );
             batchInfos.push_back(batchInfo);
             batchWg->add(1);
             asyncCh.write(batchInfo);
@@ -281,7 +299,8 @@ void asyncWorker(
 
         if (!batchCompleted) {
             for (auto& batchInfo : batchInfos) {
-                batchInfo->completed.exchange(true);
+                batchInfo->request.state.store(
+                    RequestState::BatchTimeout, std::memory_order_release);
             }
 
             batchWg->wait();
