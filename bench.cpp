@@ -29,7 +29,7 @@ namespace {
 
 constexpr int REDIS_ERR_BATCHTIMEOUT = 100;
 const uint32_t BENCH_CMD_DATA_ID = APCT_MAX_DATA_ID - 1;
-enum class RequestState { Pending, Completed, BatchTimeout };
+enum class RequestState { IN_PROGRESS, DONE, BATCH_TIMEOUT };
 
 
 using RedisReplyPointer =
@@ -170,13 +170,11 @@ private:
 
 struct RedisRequest {
     std::string userId;
-    std::function<void(int err)> onFinish;
-    std::atomic<RequestState> state{RequestState::Pending};
+    int error{0};
+    std::atomic<RequestState> state{RequestState::IN_PROGRESS};
 
-    RedisRequest(std::string userId_,
-                 std::function<void(int err)> onFinish_)
-        : userId(std::move(userId_)),
-          onFinish(std::move(onFinish_)) {}
+    RedisRequest(std::string userId_)
+        : userId(std::move(userId_)) {}
 };
 
 
@@ -190,12 +188,11 @@ struct BatchInfo {
     BatchInfo(RedisContextPtr ctx_,
               RedisPool* pool_,
               std::string userId_,
-              std::function<void(int err)> onFinish_,
               std::shared_ptr<apct::WaitGroup> wg_,
               std::string redisKey_)
         : ctx(std::move(ctx_)),
           pool(pool_),
-          request(std::move(userId_), std::move(onFinish_)),
+          request(std::move(userId_)),
           wg(std::move(wg_)),
           redisKey(std::move(redisKey_)) {}
 };
@@ -205,6 +202,22 @@ uint32_t murmurHash(const std::string& value, uint32_t seed = 0) {
     uint32_t out;
     MurmurHash3_x86_32(value.data(), value.size(), seed, &out);
     return out;
+}
+
+
+void recordMetrics(int errStatus, BenchmarkMetrics& metrics) {
+    if (errStatus == REDIS_OK) {
+        ++metrics.totalSuccess;
+    } else if (errStatus == REDIS_ERR_TIMEOUT) {
+        ++metrics.totalQueryTimeouts;
+    } else if (errStatus == REDIS_ERR_IO &&
+               (errno == EAGAIN || errno == ETIMEDOUT)) {
+        ++metrics.totalQueryTimeouts;
+    } else if (errStatus == REDIS_ERR_BATCHTIMEOUT) {
+        ++metrics.totalBatchTimeouts;
+    } else {
+        ++metrics.totalErrors;
+    }
 }
 
 
@@ -223,13 +236,12 @@ void asyncRedisWorker(apct::Channel<std::shared_ptr<BatchInfo>>& asyncCh) {
             freeReplyObject
         );
 
-        auto expected = RequestState::Pending;
+        auto expected = RequestState::IN_PROGRESS;
         if (info->request.state.compare_exchange_strong(
-                expected, RequestState::Completed, std::memory_order_acq_rel)) {
-            int err = reply ? REDIS_OK : ctx->err;
-            info->request.onFinish(err);
+                expected, RequestState::DONE, std::memory_order_acq_rel)) {
+            info->request.error = reply ? REDIS_OK : ctx->err;
         } else {
-            info->request.onFinish(REDIS_ERR_BATCHTIMEOUT);
+            info->request.error = REDIS_ERR_BATCHTIMEOUT;
         }
 
         info->pool->release(std::move(info->ctx));
@@ -275,17 +287,6 @@ void asyncWorker(
                 std::move(ctx),
                 &pool,
                 std::move(uid),
-                [&metrics](int errStatus) {
-                    if (errStatus == REDIS_OK) {
-                        ++metrics.totalSuccess;
-                    } else if (errStatus == REDIS_ERR_TIMEOUT) {
-                        ++metrics.totalQueryTimeouts;
-                    } else if (errStatus == REDIS_ERR_BATCHTIMEOUT) {
-                        ++metrics.totalBatchTimeouts;
-                    } else {
-                        ++metrics.totalErrors;
-                    }
-                },
                 batchWg,
                 redisKey
             );
@@ -300,10 +301,14 @@ void asyncWorker(
         if (!batchCompleted) {
             for (auto& batchInfo : batchInfos) {
                 batchInfo->request.state.store(
-                    RequestState::BatchTimeout, std::memory_order_release);
+                    RequestState::BATCH_TIMEOUT, std::memory_order_release);
             }
 
             batchWg->wait();
+        }
+
+        for (auto& batchInfo : batchInfos) {
+            recordMetrics(batchInfo->request.error, metrics);
         }
 
         if (channelClosed) {
@@ -323,6 +328,9 @@ void syncWorker(
     while (true) {
         auto batchDeadline = std::chrono::high_resolution_clock::now() +
                              std::chrono::microseconds(waitDuration);
+        std::vector<int> batchErrors;
+        batchErrors.reserve(batches);
+
         bool channelClosed = false;
         bool batchTimedOut = false;
         for (int i = 0; i < batches; ++i) {
@@ -335,7 +343,7 @@ void syncWorker(
             ++metrics.totalRequests;
 
             if (batchTimedOut) {
-                ++metrics.totalBatchTimeouts;
+                batchErrors.push_back(REDIS_ERR_BATCHTIMEOUT);
                 continue;
             }
 
@@ -344,7 +352,7 @@ void syncWorker(
 
             auto ctx = pool.acquire();
             if (!ctx) {
-                ++metrics.totalErrors;
+                batchErrors.push_back(REDIS_ERR);
                 continue;
             }
 
@@ -357,26 +365,20 @@ void syncWorker(
                 freeReplyObject
             );
 
+            int error = reply ? REDIS_OK : ctx->err;
+
             auto now = std::chrono::high_resolution_clock::now();
-
             if (now > batchDeadline) {
+                error = REDIS_ERR_BATCHTIMEOUT;
                 batchTimedOut = true;
-                ++metrics.totalBatchTimeouts;
-                pool.release(std::move(ctx));
-                continue;
             }
 
-            if (!reply) {
-                if (ctx->err == REDIS_ERR_TIMEOUT) {
-                    ++metrics.totalQueryTimeouts;
-                } else {
-                    ++metrics.totalErrors;
-                }
-            } else {
-                ++metrics.totalSuccess;
-            }
-
+            batchErrors.push_back(error);
             pool.release(std::move(ctx));
+        }
+
+        for (int error : batchErrors) {
+            recordMetrics(error, metrics);
         }
 
         if (channelClosed) {
@@ -503,11 +505,9 @@ private:
         } else {
             std::cout << "Running in synchronous mode.\n";
 
-            std::vector<std::thread> workers;
-            workers.reserve(workerThreadCount_);
-
             benchStart = std::chrono::high_resolution_clock::now();
 
+            std::vector<std::thread> workers;
             for (int i = 0; i < workerThreadCount_; ++i) {
                 workers.emplace_back(syncWorker, std::cref(waitDuration_),
                                      std::cref(batches_), std::cref(redisKey),
