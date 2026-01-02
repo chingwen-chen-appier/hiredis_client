@@ -413,6 +413,12 @@ public:
 private:
     void setup() override {
         auto app = cliApp();
+        app->add_option("--key", key_, "Redis hash key for HGET operations")
+            ->required();
+        app->add_option("--input",
+                        input_,
+                        "Input file containing hash fields for HGET operations")
+            ->required();
         app->add_flag("--async",
                       asyncMode_,
                       "Use asynchronous operations for benchmark");
@@ -432,7 +438,7 @@ private:
                         batches_,
                         "Number of requests per batch")
             ->default_val(10);
-        app->add_option("--async-threads",
+        app->add_option("--async_threads",
                         asyncThreadCount_,
                         "Number of async Redis worker threads "
                         "(async mode only)")
@@ -449,8 +455,6 @@ private:
         const int connectionTimeoutMs =
             config["connection_timeout_ms"].as<int>();
         const int queryTimeoutMs = config["query_timeout_ms"].as<int>();
-        const std::string userIdFile = config["user_id_file"].as<std::string>();
-        const std::string redisKey = config["user_db_key"].as<std::string>();
 
         timeval connectionTimeout{connectionTimeoutMs / 1000,
                                   (connectionTimeoutMs % 1000) * 1000};
@@ -471,7 +475,7 @@ private:
         }
 
         std::vector<std::string> userIds;
-        std::ifstream infile(userIdFile);
+        std::ifstream infile(input_);
         for (std::string line; std::getline(infile, line);) {
             if (!line.empty()) userIds.emplace_back(std::move(line));
         }
@@ -506,7 +510,7 @@ private:
             std::vector<std::thread> workers;
             for (int i = 0; i < workerThreadCount_; ++i) {
                 workers.emplace_back(asyncWorker, waitDuration_, batches_,
-                                     std::cref(redisKey), std::ref(poolSet),
+                                     std::cref(key_), std::ref(poolSet),
                                      std::ref(userIdCh), std::ref(asyncCh),
                                      std::ref(metrics));
             }
@@ -528,7 +532,7 @@ private:
             std::vector<std::thread> workers;
             for (int i = 0; i < workerThreadCount_; ++i) {
                 workers.emplace_back(syncWorker, std::cref(waitDuration_),
-                                     std::cref(batches_), std::cref(redisKey),
+                                     std::cref(batches_), std::cref(key_),
                                      std::ref(poolSet), std::ref(userIdCh),
                                      std::ref(metrics));
             }
@@ -566,6 +570,8 @@ private:
     }
 
 private:
+    std::string key_;
+    std::string input_;
     bool asyncMode_ = false;
     uint64_t waitDuration_ = 1000;
     int workerThreadCount_ = 1;
