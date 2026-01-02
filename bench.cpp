@@ -32,7 +32,7 @@ const uint32_t BENCH_CMD_DATA_ID = APCT_MAX_DATA_ID - 1;
 enum class RequestState { IN_PROGRESS, DONE, BATCH_TIMEOUT };
 
 
-using RedisReplyPointer =
+using RedisReplyPtr =
     std::unique_ptr<redisReply, decltype(&freeReplyObject)>;
 using RedisContextPtr = std::unique_ptr<redisContext, decltype(&redisFree)>;
 
@@ -55,15 +55,6 @@ public:
 
 private:
     YAML::Node config_;
-};
-
-
-struct BenchmarkMetrics {
-    std::atomic<long> totalRequests{0};
-    std::atomic<long> totalSuccess{0};
-    std::atomic<long> totalErrors{0};
-    std::atomic<long> totalQueryTimeouts{0};
-    std::atomic<long> totalBatchTimeouts{0};
 };
 
 
@@ -171,10 +162,19 @@ private:
 struct RedisRequest {
     std::string userId;
     int error{0};
+    int savedErrno{0};
     std::atomic<RequestState> state{RequestState::IN_PROGRESS};
+
+    RedisRequest() = default;
 
     RedisRequest(std::string userId_)
         : userId(std::move(userId_)) {}
+
+    RedisRequest(RedisRequest&& other) noexcept
+        : userId(std::move(other.userId)),
+          error(other.error),
+          savedErrno(other.savedErrno),
+          state(other.state.load()) {}
 };
 
 
@@ -198,6 +198,15 @@ struct BatchInfo {
 };
 
 
+struct BenchmarkMetrics {
+    std::atomic<long> totalRequests{0};
+    std::atomic<long> totalSuccess{0};
+    std::atomic<long> totalErrors{0};
+    std::atomic<long> totalQueryTimeouts{0};
+    std::atomic<long> totalBatchTimeouts{0};
+};
+
+
 uint32_t murmurHash(const std::string& value, uint32_t seed = 0) {
     uint32_t out;
     MurmurHash3_x86_32(value.data(), value.size(), seed, &out);
@@ -205,15 +214,16 @@ uint32_t murmurHash(const std::string& value, uint32_t seed = 0) {
 }
 
 
-void recordMetrics(int errStatus, BenchmarkMetrics& metrics) {
-    if (errStatus == REDIS_OK) {
+void recordMetrics(const RedisRequest& request, BenchmarkMetrics& metrics) {
+    if (request.error == REDIS_OK) {
         ++metrics.totalSuccess;
-    } else if (errStatus == REDIS_ERR_TIMEOUT) {
+    } else if (request.error == REDIS_ERR_TIMEOUT) {
         ++metrics.totalQueryTimeouts;
-    } else if (errStatus == REDIS_ERR_IO &&
-               (errno == EAGAIN || errno == ETIMEDOUT)) {
+    } else if (request.error == REDIS_ERR_IO &&
+              (request.savedErrno == EAGAIN ||
+               request.savedErrno == ETIMEDOUT)) {
         ++metrics.totalQueryTimeouts;
-    } else if (errStatus == REDIS_ERR_BATCHTIMEOUT) {
+    } else if (request.error == REDIS_ERR_BATCHTIMEOUT) {
         ++metrics.totalBatchTimeouts;
     } else {
         ++metrics.totalErrors;
@@ -227,7 +237,7 @@ void asyncRedisWorker(apct::Channel<std::shared_ptr<BatchInfo>>& asyncCh) {
         if (!ok) break;
 
         redisContext* ctx = info->ctx.get();
-        RedisReplyPointer reply(
+        RedisReplyPtr reply(
             static_cast<redisReply*>(
                 redisCommand(ctx, "HGET %s %s",
                              info->redisKey.c_str(),
@@ -240,6 +250,7 @@ void asyncRedisWorker(apct::Channel<std::shared_ptr<BatchInfo>>& asyncCh) {
         if (info->request.state.compare_exchange_strong(
                 expected, RequestState::DONE, std::memory_order_acq_rel)) {
             info->request.error = reply ? REDIS_OK : ctx->err;
+            info->request.savedErrno = errno;
         } else {
             info->request.error = REDIS_ERR_BATCHTIMEOUT;
         }
@@ -308,7 +319,7 @@ void asyncWorker(
         }
 
         for (auto& batchInfo : batchInfos) {
-            recordMetrics(batchInfo->request.error, metrics);
+            recordMetrics(batchInfo->request, metrics);
         }
 
         if (channelClosed) {
@@ -328,8 +339,8 @@ void syncWorker(
     while (true) {
         auto batchDeadline = std::chrono::high_resolution_clock::now() +
                              std::chrono::microseconds(waitDuration);
-        std::vector<int> batchErrors;
-        batchErrors.reserve(batches);
+        std::vector<std::shared_ptr<RedisRequest>> requests;
+        requests.reserve(batches);
 
         bool channelClosed = false;
         bool batchTimedOut = false;
@@ -342,30 +353,35 @@ void syncWorker(
 
             ++metrics.totalRequests;
 
+            auto request = std::make_shared<RedisRequest>(std::move(uid));
+
             if (batchTimedOut) {
-                batchErrors.push_back(REDIS_ERR_BATCHTIMEOUT);
+                request->error = REDIS_ERR_BATCHTIMEOUT;
+                requests.push_back(request);
                 continue;
             }
 
-            size_t poolIndex = murmurHash(uid) % poolSet.size();
+            size_t poolIndex = murmurHash(request->userId) % poolSet.size();
             RedisPool& pool = poolSet.get(poolIndex);
 
             auto ctx = pool.acquire();
             if (!ctx) {
-                batchErrors.push_back(REDIS_ERR);
+                request->error = REDIS_ERR;
+                requests.push_back(request);
                 continue;
             }
 
-            RedisReplyPointer reply(
+            RedisReplyPtr reply(
                 static_cast<redisReply*>(
                     redisCommand(ctx.get(), "HGET %s %s",
                                  redisKey.c_str(),
-                                 uid.c_str())
+                                 request->userId.c_str())
                 ),
                 freeReplyObject
             );
 
             int error = reply ? REDIS_OK : ctx->err;
+            int savedErrno = errno;
 
             auto now = std::chrono::high_resolution_clock::now();
             if (now > batchDeadline) {
@@ -373,12 +389,14 @@ void syncWorker(
                 batchTimedOut = true;
             }
 
-            batchErrors.push_back(error);
+            request->error = error;
+            request->savedErrno = savedErrno;
+            requests.push_back(request);
             pool.release(std::move(ctx));
         }
 
-        for (int error : batchErrors) {
-            recordMetrics(error, metrics);
+        for (const auto& request : requests) {
+            recordMetrics(*request, metrics);
         }
 
         if (channelClosed) {
