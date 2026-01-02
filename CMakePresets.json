@@ -1,0 +1,102 @@
+{
+    "version": 10,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 31
+    },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/workspace/build/${presetName}",
+            "installDir": "${sourceDir}/workspace/install",
+            "cacheVariables": {
+                "cflags": "-g3 -Wall -Wextra -Wpedantic -Wno-unused-parameter -Wno-missing-field-initializers",
+                "CMAKE_PREFIX_PATH": "/opt/appier/xdep;/opt/appier/cntk"
+            }
+        },
+        {
+            "name": "default_debug",
+            "displayName": "Debug",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "default_release",
+            "displayName": "Release",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "default_rel_with_deb_info",
+            "displayName": "RelWithDebInfo",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+            }
+        },
+        {
+            "name": "default_min_size_rel",
+            "displayName": "MinSizeRel",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "MinSizeRel"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "configurePreset": "base",
+            "verbose": false
+        },
+        {
+            "name": "default_debug",
+            "inherits": "base",
+            "configurePreset": "default_debug"
+        },
+        {
+            "name": "default_release",
+            "inherits": "base",
+            "configurePreset": "default_release"
+        },
+        {
+            "name": "default_rel_with_deb_info",
+            "inherits": "base",
+            "configurePreset": "default_rel_with_deb_info"
+        },
+        {
+            "name": "default_min_size_rel",
+            "inherits": "base",
+            "configurePreset": "default_min_size_rel"
+        },
+        {
+            "name": "default_release_install",
+            "inherits": "base",
+            "configurePreset": "default_release",
+            "targets": ["install"]
+        }
+    ],
+    "workflowPresets": [
+        {
+            "name": "default_release",
+            "displayName": "Release Workflow",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "default_release"
+                },
+                {
+                    "type": "build",
+                    "name": "default_release_install"
+                }
+            ]
+        }
+    ]
+}

@@ -1,36 +1,49 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.31)
 
-project(RedisBenchmark VERSION 1.0 LANGUAGES CXX)
+project(hiredis_client)
 
-# Set C++ standard
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_C_STANDARD 23)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
 
-# Include directories
+find_package(Threads REQUIRED)
+
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} ${cflags}")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${cflags}")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} ${cflags}")
+set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL} ${cflags}")
+
+set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} ${cflags}")
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} ${cflags}")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO} ${cflags}")
+set(CMAKE_C_FLAGS_MINSIZEREL "${CMAKE_C_FLAGS_MINSIZEREL} ${cflags}")
+
 include_directories(
+    ${CMAKE_SOURCE_DIR}/include
     /opt/appier/xdep/include
     /opt/appier/cntk/include
 )
 
-# Library directories
 link_directories(
     /opt/appier/xdep/lib
     /opt/appier/cntk/lib
 )
 
-# Add executable
-add_executable(bench
-    bench.cpp
+add_executable(hiredis_client
+    src/hiredis_client.cpp
 )
 
-# Link libraries
-target_link_libraries(bench
+target_link_libraries(hiredis_client
+    PRIVATE
     cntk
-    cntk_proc
-    cntk_service
     fmt
     hiredis
     yaml-cpp
     murmur3
-    pthread
+    Threads::Threads
 )
+
+install(TARGETS hiredis_client RUNTIME DESTINATION bin)

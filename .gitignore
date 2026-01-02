@@ -7,4 +7,4 @@
 .env
 .vscode
 CMakeUserPresets.json
-build
+workspace
