@@ -202,6 +202,7 @@ private:
     std::string key_;
     std::string input_;
     bool asyncMode_ = false;
+    bool recordTimeoutKeys_ = false;
     uint64_t waitDuration_ = 1000;
     size_t workerThreadCount_ = 1;
     size_t times_ = 1;

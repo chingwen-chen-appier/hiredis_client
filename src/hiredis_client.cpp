@@ -71,11 +71,17 @@ void asyncRedisWorker(apct::Channel<std::shared_ptr<BatchInfo>>& asyncCh) {
 void asyncWorker(
         const uint64_t waitDuration,
         const size_t batches,
+        const bool recordTimeoutKeys,
         const std::string& redisKey,
         RedisPoolSet& poolSet,
         apct::Channel<std::string>& userIdCh,
         apct::Channel<std::shared_ptr<BatchInfo>>& asyncCh,
-        BenchmarkMetrics& metrics) {
+        BenchmarkMetrics& metrics,
+        std::vector<std::string>& timeoutKeys,
+        std::mutex& timeoutKeysMutex,
+        std::chrono::steady_clock::duration& threadDuration,
+        size_t& batchCount) {
+    auto start = std::chrono::high_resolution_clock::now();
 
     while (true) {
         auto batchWg = std::make_shared<apct::WaitGroup>();
@@ -125,24 +131,41 @@ void asyncWorker(
             batchWg->wait();
         }
 
+        ++batchCount;
+
         for (auto& batchInfo : batchInfos) {
             recordMetrics(batchInfo->request, metrics);
+            if (recordTimeoutKeys &&
+                batchInfo->request.error == REDIS_ERR_BATCHTIMEOUT) {
+                std::lock_guard<std::mutex> lock(timeoutKeysMutex);
+                timeoutKeys.push_back(batchInfo->request.userId);
+            }
         }
 
         if (channelClosed) {
             break;
         }
     }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    threadDuration = end - start;
 }
 
 
 void syncWorker(
         const uint64_t waitDuration,
         const size_t batches,
+        const bool recordTimeoutKeys,
         const std::string& redisKey,
         RedisPoolSet& poolSet,
         apct::Channel<std::string>& userIdCh,
-        BenchmarkMetrics& metrics) {
+        BenchmarkMetrics& metrics,
+        std::vector<std::string>& timeoutKeys,
+        std::mutex& timeoutKeysMutex,
+        std::chrono::steady_clock::duration& threadDuration,
+        size_t& batchCount) {
+    auto start = std::chrono::high_resolution_clock::now();
+
     while (true) {
         auto batchDeadline = std::chrono::high_resolution_clock::now() +
                              std::chrono::microseconds(waitDuration);
@@ -202,14 +225,24 @@ void syncWorker(
             pool.release(std::move(ctx));
         }
 
+        ++batchCount;
+
         for (const auto& request : requests) {
             recordMetrics(*request, metrics);
+            if (recordTimeoutKeys &&
+                request->error == REDIS_ERR_BATCHTIMEOUT) {
+                std::lock_guard<std::mutex> lock(timeoutKeysMutex);
+                timeoutKeys.push_back(request->userId);
+            }
         }
 
         if (channelClosed) {
             break;
         }
     }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    threadDuration = end - start;
 }
 
 
@@ -252,6 +285,9 @@ void RedisBenchCommand::setup() {
                         "Number of async Redis worker threads "
                         "(async mode only)")
             ->default_val(0);
+        app->add_flag("--timeout_keys",
+                      recordTimeoutKeys_,
+                      "Output keys that timed out during the benchmark");
 }
 
 std::pair<int, bool> RedisBenchCommand::forwardRun() {
@@ -303,6 +339,11 @@ std::pair<int, bool> RedisBenchCommand::forwardRun() {
         userIdCh.close();
     });
 
+    std::vector<std::string> timeoutKeys;
+    std::mutex timeoutKeysMutex;
+    std::vector<std::chrono::steady_clock::duration> durs(
+        workerThreadCount_, std::chrono::steady_clock::duration::zero());
+    std::vector<size_t> batchCounts(workerThreadCount_, 0);
     BenchmarkMetrics metrics;
     std::chrono::high_resolution_clock::time_point benchStart;
 
@@ -318,10 +359,14 @@ std::pair<int, bool> RedisBenchCommand::forwardRun() {
 
         std::vector<std::thread> workers;
         for (size_t i = 0; i < workerThreadCount_; ++i) {
-            workers.emplace_back(asyncWorker, waitDuration_, batches_,
+            workers.emplace_back(asyncWorker, std::cref(waitDuration_),
+                                 std::cref(batches_),
+                                 std::cref(recordTimeoutKeys_),
                                  std::cref(key_), std::ref(poolSet),
                                  std::ref(userIdCh), std::ref(asyncCh),
-                                 std::ref(metrics));
+                                 std::ref(metrics), std::ref(timeoutKeys),
+                                 std::ref(timeoutKeysMutex), std::ref(durs[i]),
+                                 std::ref(batchCounts[i]));
         }
 
         for (auto& worker : workers) {
@@ -341,9 +386,12 @@ std::pair<int, bool> RedisBenchCommand::forwardRun() {
         std::vector<std::thread> workers;
         for (size_t i = 0; i < workerThreadCount_; ++i) {
             workers.emplace_back(syncWorker, std::cref(waitDuration_),
-                                 std::cref(batches_), std::cref(key_),
-                                 std::ref(poolSet), std::ref(userIdCh),
-                                 std::ref(metrics));
+                                 std::cref(batches_), std::cref(recordTimeoutKeys_),
+                                 std::cref(key_), std::ref(poolSet),
+                                 std::ref(userIdCh), std::ref(metrics),
+                                 std::ref(timeoutKeys), std::ref(timeoutKeysMutex),
+                                 std::ref(durs[i]),
+                                 std::ref(batchCounts[i]));
         }
 
         for (auto& worker : workers) {
@@ -351,29 +399,56 @@ std::pair<int, bool> RedisBenchCommand::forwardRun() {
         }
     }
 
+    auto benchEnd = std::chrono::high_resolution_clock::now();
     userThread.join();
 
-    auto benchEnd = std::chrono::high_resolution_clock::now();
-    double elapsedSeconds =
-        std::chrono::duration<double>(benchEnd - benchStart).count();
-    long long elapsedMicroseconds =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            benchEnd - benchStart).count();
-    double average = elapsedMicroseconds / metrics.totalRequests;
+    auto ops = metrics.totalRequests.load();
+    auto totalDuration =
+        std::chrono::duration_cast<std::chrono::duration<double>>
+        (benchEnd - benchStart);
+    auto durationSum = std::accumulate(
+        durs.begin(),
+        durs.end(),
+        std::chrono::steady_clock::duration::zero());
+    auto batchSum = std::accumulate(batchCounts.begin(),
+                                    batchCounts.end(),
+                                    0);
+    auto qps = static_cast<double>(ops) / totalDuration.count();
+    auto totalOPAverage = totalDuration / ops;
+    auto totalBatchAverage = totalDuration / batchSum;
+    auto opAverage = durationSum / ops;
+    auto batchAverage = durationSum / batchSum;
 
     std::cout << "\n--- Benchmark Results ---\n";
-    std::cout << "Total Requests: " << metrics.totalRequests << "\n";
-    std::cout << "Success:        " << metrics.totalSuccess << "\n";
-    std::cout << "Query Timeouts: " << metrics.totalQueryTimeouts << "\n";
-    std::cout << "Batch Timeouts: " << metrics.totalBatchTimeouts << "\n";
-    std::cout << "Errors:         " << metrics.totalErrors << "\n";
-    std::cout << "Elapsed Time:   " << elapsedSeconds << " s\n";
-    std::cout << "Average req time:   "
-              << average
-              << " us\n";
-    std::cout << "Average req time (Thread):   "
-              << average * workerThreadCount_
-              << " us\n";
+    std::cout << "Operations: " << ops << std::endl;
+    std::cout << "Total Duration: " << totalDuration.count() << "s" << std::endl;
+    std::cout << "QPS: " << static_cast<size_t>(qps) << std::endl;
+    std::cout << "Total OP Average: " << totalOPAverage.count() << "s" << std::endl;
+    std::cout << "Total Batch Average: "
+        << std::chrono::duration_cast<std::chrono::microseconds>(
+            totalBatchAverage)
+                .count()
+        << "us" << std::endl;
+    std::cout << "OP Average: "
+        << std::chrono::duration_cast<std::chrono::microseconds>(
+                    opAverage)
+                .count()
+        << "us" << std::endl;
+    std::cout << "Batch Average: "
+        << std::chrono::duration_cast<std::chrono::microseconds>(
+                    batchAverage)
+                .count()
+        << "us" << std::endl;
+    std::cout << "Success:        " << metrics.totalSuccess << std::endl;
+    std::cout << "Query Timeouts: " << metrics.totalQueryTimeouts << std::endl;
+    std::cout << "Batch Timeouts: " << metrics.totalBatchTimeouts << std::endl;
+    std::cout << "Errors:         " << metrics.totalErrors << std::endl;
+    if (recordTimeoutKeys_) {
+        std::cout << "Timeout keys:" << std::endl;
+        for (const auto& ckey : timeoutKeys) {
+            std::cout << ckey << std::endl;
+        }
+    }
 
     return { 0, false };
 }
