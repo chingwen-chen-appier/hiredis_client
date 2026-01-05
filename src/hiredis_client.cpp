@@ -421,23 +421,25 @@ std::pair<int, bool> RedisBenchCommand::forwardRun() {
 
     std::cout << "\n--- Benchmark Results ---\n";
     std::cout << "Operations: " << ops << std::endl;
-    std::cout << "Total Duration: " << totalDuration.count() << "s" << std::endl;
+    std::cout << "Total Duration: "
+        << totalDuration.count()
+        << "s" << std::endl;
     std::cout << "QPS: " << static_cast<size_t>(qps) << std::endl;
-    std::cout << "Total OP Average: " << totalOPAverage.count() << "s" << std::endl;
+    std::cout << "Total OP Average: "
+        << std::chrono::duration_cast<std::chrono::microseconds>(
+            totalOPAverage).count()
+        << "us" << std::endl;
     std::cout << "Total Batch Average: "
         << std::chrono::duration_cast<std::chrono::microseconds>(
-            totalBatchAverage)
-                .count()
+            totalBatchAverage).count()
         << "us" << std::endl;
     std::cout << "OP Average: "
         << std::chrono::duration_cast<std::chrono::microseconds>(
-                    opAverage)
-                .count()
+            opAverage).count()
         << "us" << std::endl;
     std::cout << "Batch Average: "
         << std::chrono::duration_cast<std::chrono::microseconds>(
-                    batchAverage)
-                .count()
+            batchAverage).count()
         << "us" << std::endl;
     std::cout << "Success:        " << metrics.totalSuccess << std::endl;
     std::cout << "Query Timeouts: " << metrics.totalQueryTimeouts << std::endl;
