@@ -203,11 +203,11 @@ private:
     std::string input_;
     bool asyncMode_ = false;
     bool recordTimeoutKeys_ = false;
-    uint64_t waitDuration_ = 1000;
+    uint64_t waitDuration_ = 10000;
     size_t workerThreadCount_ = 1;
     size_t times_ = 1;
-    size_t batches_ = 100;
-    size_t asyncThreadCount_ = 0;
+    size_t batches_ = 10;
+    size_t asyncThreadCount_ = 1;
 };
 
 

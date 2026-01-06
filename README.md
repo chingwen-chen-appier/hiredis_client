@@ -73,7 +73,7 @@ query_timeout_ms: 1000
 | `--batches` | Number of requests per batch | `10` |
 | `--wait` | Batch timeout in microseconds (operations exceeding this are marked as batch timeouts) | `10000` |
 | `--times` | Number of iterations through the entire input file | `1` |
-| `--async_threads` | Number of async Redis worker threads (async mode only) | `0` |
+| `--async_threads` | Number of async Redis worker threads (async mode only) | `1` |
 | `--timeout_keys` | Output list of keys that timed out during the benchmark | `false` |
 
 #### Configuration File Parameters (bench.yaml)
